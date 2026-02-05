@@ -1,0 +1,14 @@
+services:
+  memorieden:
+    build: .
+    container_name: memorieden
+    ports:
+      - "127.0.0.1:18001:8000"
+    environment:
+      - MEMORIEDEN_DB=/data/memorieden.sqlite3
+      # Optional single-tenant auth. If set, all /memories/* endpoints require header: X-API-Key: <value>
+      # - MEMORIEDEN_API_KEY=change-me
+    volumes:
+      # Persist DB on the SSD (outside the container) for easy upgrades/migration.
+      - /mnt/m2/memorieden:/data
+    restart: unless-stopped

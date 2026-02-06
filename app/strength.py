@@ -59,6 +59,12 @@ def calculate_strength(
     if access_boost_factor is None:
         access_boost_factor = config.MEMORY_ACCESS_BOOST_FACTOR
     
+    # Guard against invalid parameters
+    if half_life_days <= 0:
+        half_life_days = 30.0  # Fallback to default
+    if access_count < 0:
+        access_count = 0  # Floor at 0
+    
     # Parse timestamps
     created_dt = parse_iso_timestamp(created_at)
     if created_dt is None:
@@ -92,10 +98,14 @@ def calculate_strength_from_row(row: sqlite3.Row) -> float:
     
     Expects row to have: created_at, last_accessed_at, access_count
     """
+    # sqlite3.Row doesn't have .get() method - use direct access with fallback
+    last_accessed = row["last_accessed_at"] if "last_accessed_at" in row.keys() else None
+    access_count = row["access_count"] if "access_count" in row.keys() else 0
+    
     return calculate_strength(
         created_at=row["created_at"],
-        last_accessed_at=row.get("last_accessed_at"),
-        access_count=row.get("access_count") or 0,
+        last_accessed_at=last_accessed,
+        access_count=access_count or 0,
     )
 
 
@@ -141,6 +151,13 @@ def get_strength_details(
     Returns:
         Dictionary with strength components and metadata
     """
+    # Guard against invalid parameters
+    if access_count < 0:
+        access_count = 0
+    half_life_days = config.MEMORY_DECAY_HALF_LIFE_DAYS
+    if half_life_days <= 0:
+        half_life_days = 30.0
+    
     created_dt = parse_iso_timestamp(created_at)
     last_accessed_dt = parse_iso_timestamp(last_accessed_at)
     now = datetime.now(timezone.utc)
@@ -149,7 +166,7 @@ def get_strength_details(
     
     if reference_dt:
         days_elapsed = (now - reference_dt).total_seconds() / 86400.0
-        decay_rate = math.log(2) / config.MEMORY_DECAY_HALF_LIFE_DAYS
+        decay_rate = math.log(2) / half_life_days
         time_decay = math.exp(-decay_rate * days_elapsed)
     else:
         days_elapsed = 0.0
@@ -165,7 +182,7 @@ def get_strength_details(
             "access_boost": access_boost,
         },
         "parameters": {
-            "half_life_days": config.MEMORY_DECAY_HALF_LIFE_DAYS,
+            "half_life_days": half_life_days,  # Use guarded value, not raw config
             "access_boost_factor": config.MEMORY_ACCESS_BOOST_FACTOR,
             "days_elapsed": days_elapsed,
             "access_count": access_count,

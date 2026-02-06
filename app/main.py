@@ -4,15 +4,24 @@ import json
 from typing import Any, Optional
 
 from fastapi import Depends, FastAPI, HTTPException, Header
+from fastapi.staticfiles import StaticFiles
+from fastapi.responses import FileResponse
 from pydantic import BaseModel, Field
 
 from .db import get_db, init_db
 from .history_api import router as history_router
 from .export_import import router as export_import_router
+from . import strength as strength_module
 
 app = FastAPI(title="MemorieDen (minimal)", version="0.6.0")
 app.include_router(history_router)
 app.include_router(export_import_router)
+
+# Mount static files for web UI
+import os
+static_path = os.path.join(os.path.dirname(__file__), "..", "static")
+if os.path.exists(static_path):
+    app.mount("/static", StaticFiles(directory=static_path), name="static")
 
 
 from .auth import require_api_key
@@ -21,6 +30,15 @@ from .auth import require_api_key
 @app.on_event("startup")
 def _startup() -> None:
     init_db()
+
+
+@app.get("/")
+def root():
+    """Serve the web UI."""
+    static_path = os.path.join(os.path.dirname(__file__), "..", "static", "index.html")
+    if os.path.exists(static_path):
+        return FileResponse(static_path)
+    return {"message": "MemorieDen API", "docs": "/docs", "health": "/health"}
 
 
 class MemoryAdd(BaseModel):
@@ -220,6 +238,7 @@ class SearchRequest(BaseModel):
     query: str = Field(..., min_length=1)
     limit: int = Field(20, ge=1, le=200)
     user_id: Optional[str] = None
+    track_access: bool = Field(False, description="If true, increment access count for returned memories")
 
 
 class MemoryUpdate(BaseModel):
@@ -238,6 +257,9 @@ class BulkImportRequest(BaseModel):
 
 @app.post("/memories/search", dependencies=[Depends(require_api_key)])
 def search_memories(payload: SearchRequest) -> dict[str, Any]:
+    # Import config here to avoid circular dependency
+    from . import config
+    
     # FTS5 query syntax: https://sqlite.org/fts5.html
     # We accept the query as-is (user can use quotes/NEAR/etc).
     q = payload.query.strip()
@@ -246,7 +268,8 @@ def search_memories(payload: SearchRequest) -> dict[str, Any]:
         sql = (
             """
             SELECT m.id, m.created_at, m.user_id, m.source, m.title, m.content, m.tags_json, m.metadata_json,
-                   bm25(memories_fts) AS score,
+                   m.last_accessed_at, m.access_count, m.cached_strength, m.strength_updated_at,
+                   bm25(memories_fts) AS bm25_score,
                    snippet(memories_fts, 1, '[', ']', '…', 12) AS snippet
             FROM memories_fts
             JOIN memories m ON m.id = memories_fts.rowid
@@ -257,17 +280,106 @@ def search_memories(payload: SearchRequest) -> dict[str, Any]:
         if payload.user_id:
             sql += " AND (m.user_id = ?)"
             params.append(payload.user_id)
-        sql += " ORDER BY score ASC, m.id DESC LIMIT ?"
-        params.append(payload.limit)
-
+        
+        # Fetch results (no limit yet - we need all for normalization)
         rows = db.execute(sql, params).fetchall()
+        
+        if not rows:
+            return {"query": payload.query, "count": 0, "memories": []}
+        
+        # Normalize BM25 scores and combine with strength
+        # BM25 scores are negative, where more negative = better match
+        bm25_scores = [r["bm25_score"] for r in rows]
+        min_bm25 = min(bm25_scores)
+        max_bm25 = max(bm25_scores)
+        bm25_range = max_bm25 - min_bm25 if max_bm25 != min_bm25 else 1.0
+        
+        # Calculate combined scores
+        alpha = config.MEMORY_STRENGTH_BM25_WEIGHT
+        beta = config.MEMORY_STRENGTH_DECAY_WEIGHT
+        
+        results = []
+        for r in rows:
+            # Normalize BM25 to 0-1 range, then invert so higher = better
+            normalized_bm25 = (r["bm25_score"] - min_bm25) / bm25_range
+            bm25_component = 1.0 - normalized_bm25  # Invert: higher = better match
+            
+            # Get cached strength, refresh if stale
+            cached_strength = r["cached_strength"] or 1.0
+            if strength_module.should_refresh_cached_strength(r["strength_updated_at"]):
+                cached_strength = strength_module.calculate_strength(
+                    created_at=r["created_at"],
+                    last_accessed_at=r["last_accessed_at"],
+                    access_count=r["access_count"] or 0,
+                )
+                # Update cache
+                db.execute(
+                    """
+                    UPDATE memories
+                    SET cached_strength = ?,
+                        strength_updated_at = strftime('%Y-%m-%dT%H:%M:%fZ','now')
+                    WHERE id = ?
+                    """,
+                    (cached_strength, r["id"]),
+                )
+            
+            # Combined score: higher = better
+            final_score = (alpha * bm25_component) + (beta * cached_strength)
+            
+            results.append({
+                "row": r,
+                "bm25_score": r["bm25_score"],
+                "strength": cached_strength,
+                "final_score": final_score,
+            })
+        
+        # Commit any cache updates
+        db.commit()
+        
+        # Sort by final score (descending - higher is better)
+        results.sort(key=lambda x: x["final_score"], reverse=True)
+        
+        # Apply limit
+        results = results[:payload.limit]
+        
+        # Track access if requested
+        if payload.track_access:
+            for result in results:
+                r = result["row"]
+                new_access_count = (r["access_count"] or 0) + 1
+                new_strength = strength_module.calculate_strength(
+                    created_at=r["created_at"],
+                    last_accessed_at=None,  # Will use current time
+                    access_count=new_access_count,
+                )
+                db.execute(
+                    """
+                    UPDATE memories
+                    SET last_accessed_at = strftime('%Y-%m-%dT%H:%M:%fZ','now'),
+                        access_count = ?,
+                        cached_strength = ?,
+                        strength_updated_at = strftime('%Y-%m-%dT%H:%M:%fZ','now')
+                    WHERE id = ?
+                    """,
+                    (new_access_count, new_strength, r["id"]),
+                )
+            db.commit()
+    
+    # Format response
+    memories = []
+    for result in results:
+        r = result["row"]
+        mem_dict = _row_to_dict(r)
+        mem_dict["score"] = result["bm25_score"]
+        mem_dict["snippet"] = r["snippet"]
+        mem_dict["final_score"] = result["final_score"]
+        mem_dict["strength"] = result["strength"]
+        memories.append(mem_dict)
 
     return {
         "query": payload.query,
-        "count": len(rows),
-        "memories": [
-            {**_row_to_dict(r), "score": r["score"], "snippet": r["snippet"]} for r in rows
-        ],
+        "count": len(memories),
+        "memories": memories,
     }
 
 
@@ -296,16 +408,65 @@ def bulk_import(payload: BulkImportRequest) -> dict[str, Any]:
     return {"inserted": len(inserted), "ids": [x["id"] for x in inserted]}
 
 
+@app.get("/memories/all", dependencies=[Depends(require_api_key)])
+def all_memories(limit: int = 200, user_id: Optional[str] = None) -> dict[str, Any]:
+    if limit < 1 or limit > 2000:
+        raise HTTPException(status_code=400, detail="limit must be 1..2000")
+
+    with get_db() as db:
+        sql = "SELECT id, created_at, user_id, source, title, content, tags_json, metadata_json, " \
+              "last_accessed_at, access_count, cached_strength, strength_updated_at FROM memories"
+        params: list[Any] = []
+        if user_id:
+            sql += " WHERE user_id = ?"
+            params.append(user_id)
+        sql += " ORDER BY id DESC LIMIT ?"
+        params.append(limit)
+        rows = db.execute(sql, params).fetchall()
+
+    return {"count": len(rows), "memories": [_row_to_dict(r) for r in rows]}
+
+
 @app.get("/memories/{memory_id}", dependencies=[Depends(require_api_key)])
 def get_memory(memory_id: int) -> dict[str, Any]:
     with get_db() as db:
         row = db.execute(
-            "SELECT id, created_at, user_id, source, title, content, tags_json, metadata_json FROM memories WHERE id=?",
+            "SELECT id, created_at, user_id, source, title, content, tags_json, metadata_json, "
+            "last_accessed_at, access_count, cached_strength, strength_updated_at FROM memories WHERE id=?",
             (memory_id,),
         ).fetchone()
-    if not row:
-        raise HTTPException(status_code=404, detail="not found")
-    return {"memory": _row_to_dict(row)}
+        if not row:
+            raise HTTPException(status_code=404, detail="not found")
+        
+        # Track access: increment count, update timestamps, refresh strength
+        new_access_count = (row["access_count"] or 0) + 1
+        new_strength = strength_module.calculate_strength(
+            created_at=row["created_at"],
+            last_accessed_at=None,  # Will use current time (just accessed now)
+            access_count=new_access_count,
+        )
+        
+        db.execute(
+            """
+            UPDATE memories
+            SET last_accessed_at = strftime('%Y-%m-%dT%H:%M:%fZ','now'),
+                access_count = ?,
+                cached_strength = ?,
+                strength_updated_at = strftime('%Y-%m-%dT%H:%M:%fZ','now')
+            WHERE id = ?
+            """,
+            (new_access_count, new_strength, memory_id),
+        )
+        db.commit()
+        
+        # Fetch updated row
+        updated_row = db.execute(
+            "SELECT id, created_at, user_id, source, title, content, tags_json, metadata_json, "
+            "last_accessed_at, access_count, cached_strength, strength_updated_at FROM memories WHERE id=?",
+            (memory_id,),
+        ).fetchone()
+    
+    return {"memory": _row_to_dict(updated_row)}
 
 
 @app.put("/memories/{memory_id}", dependencies=[Depends(require_api_key)])
@@ -383,6 +544,75 @@ def update_memory(memory_id: int, payload: MemoryUpdate) -> dict[str, Any]:
     return {"memory": _row_to_dict(updated)}
 
 
+@app.post("/memories/{memory_id}/access", dependencies=[Depends(require_api_key)])
+def record_access(memory_id: int) -> dict[str, Any]:
+    """Explicitly record an access to a memory (for manual control)."""
+    with get_db() as db:
+        row = db.execute(
+            "SELECT id, created_at, user_id, source, title, content, tags_json, metadata_json, "
+            "last_accessed_at, access_count, cached_strength, strength_updated_at FROM memories WHERE id=?",
+            (memory_id,),
+        ).fetchone()
+        if not row:
+            raise HTTPException(status_code=404, detail="not found")
+        
+        # Increment access count and refresh strength
+        new_access_count = (row["access_count"] or 0) + 1
+        new_strength = strength_module.calculate_strength(
+            created_at=row["created_at"],
+            last_accessed_at=None,  # Current time
+            access_count=new_access_count,
+        )
+        
+        db.execute(
+            """
+            UPDATE memories
+            SET last_accessed_at = strftime('%Y-%m-%dT%H:%M:%fZ','now'),
+                access_count = ?,
+                cached_strength = ?,
+                strength_updated_at = strftime('%Y-%m-%dT%H:%M:%fZ','now')
+            WHERE id = ?
+            """,
+            (new_access_count, new_strength, memory_id),
+        )
+        db.commit()
+    
+    return {
+        "success": True,
+        "memory_id": memory_id,
+        "access_count": new_access_count,
+        "strength": new_strength,
+    }
+
+
+@app.get("/memories/{memory_id}/strength", dependencies=[Depends(require_api_key)])
+def get_memory_strength(memory_id: int) -> dict[str, Any]:
+    """Debug endpoint to view strength calculation details."""
+    with get_db() as db:
+        row = db.execute(
+            "SELECT id, created_at, last_accessed_at, access_count, cached_strength, strength_updated_at "
+            "FROM memories WHERE id=?",
+            (memory_id,),
+        ).fetchone()
+        if not row:
+            raise HTTPException(status_code=404, detail="not found")
+    
+    details = strength_module.get_strength_details(
+        created_at=row["created_at"],
+        last_accessed_at=row["last_accessed_at"],
+        access_count=row["access_count"] or 0,
+    )
+    
+    # Add cached values for comparison
+    details["cached"] = {
+        "cached_strength": row["cached_strength"],
+        "strength_updated_at": row["strength_updated_at"],
+        "is_stale": strength_module.should_refresh_cached_strength(row["strength_updated_at"]),
+    }
+    
+    return details
+
+
 @app.delete("/memories/{memory_id}", dependencies=[Depends(require_api_key)])
 def delete_memory(memory_id: int) -> dict[str, Any]:
     with get_db() as db:
@@ -393,22 +623,50 @@ def delete_memory(memory_id: int) -> dict[str, Any]:
     return {"deleted": True, "id": memory_id}
 
 
-@app.get("/memories/all", dependencies=[Depends(require_api_key)])
-def all_memories(limit: int = 200, user_id: Optional[str] = None) -> dict[str, Any]:
-    if limit < 1 or limit > 2000:
-        raise HTTPException(status_code=400, detail="limit must be 1..2000")
-
+@app.post("/admin/refresh-strengths", dependencies=[Depends(require_api_key)])
+def refresh_all_strengths(limit: int = 1000) -> dict[str, Any]:
+    """Batch recalculate cached_strength for all memories (maintenance endpoint)."""
+    if limit < 1 or limit > 10000:
+        raise HTTPException(status_code=400, detail="limit must be 1..10000")
+    
     with get_db() as db:
-        sql = "SELECT id, created_at, user_id, source, title, content, tags_json, metadata_json FROM memories"
-        params: list[Any] = []
-        if user_id:
-            sql += " WHERE user_id = ?"
-            params.append(user_id)
-        sql += " ORDER BY id DESC LIMIT ?"
-        params.append(limit)
-        rows = db.execute(sql, params).fetchall()
-
-    return {"count": len(rows), "memories": [_row_to_dict(r) for r in rows]}
+        # Fetch all memories that need refresh
+        rows = db.execute(
+            """
+            SELECT id, created_at, last_accessed_at, access_count
+            FROM memories
+            ORDER BY id DESC
+            LIMIT ?
+            """,
+            (limit,),
+        ).fetchall()
+        
+        updated_count = 0
+        for row in rows:
+            new_strength = strength_module.calculate_strength(
+                created_at=row["created_at"],
+                last_accessed_at=row["last_accessed_at"],
+                access_count=row["access_count"] or 0,
+            )
+            
+            db.execute(
+                """
+                UPDATE memories
+                SET cached_strength = ?,
+                    strength_updated_at = strftime('%Y-%m-%dT%H:%M:%fZ','now')
+                WHERE id = ?
+                """,
+                (new_strength, row["id"]),
+            )
+            updated_count += 1
+        
+        db.commit()
+    
+    return {
+        "success": True,
+        "updated": updated_count,
+        "message": f"Refreshed strength for {updated_count} memories",
+    }
 
 
 def _row_to_dict(row) -> dict[str, Any]:
@@ -416,7 +674,8 @@ def _row_to_dict(row) -> dict[str, Any]:
         return {}
     tags = json.loads(row["tags_json"]) if row["tags_json"] else None
     metadata = json.loads(row["metadata_json"]) if row["metadata_json"] else None
-    return {
+    
+    result = {
         "id": row["id"],
         "created_at": row["created_at"],
         "user_id": row["user_id"],
@@ -426,3 +685,15 @@ def _row_to_dict(row) -> dict[str, Any]:
         "tags": tags,
         "metadata": metadata,
     }
+    
+    # Include strength fields if available in row
+    if "last_accessed_at" in row.keys():
+        result["last_accessed_at"] = row["last_accessed_at"]
+    if "access_count" in row.keys():
+        result["access_count"] = row["access_count"]
+    if "cached_strength" in row.keys():
+        result["cached_strength"] = row["cached_strength"]
+    if "strength_updated_at" in row.keys():
+        result["strength_updated_at"] = row["strength_updated_at"]
+    
+    return result

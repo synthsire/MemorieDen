@@ -114,7 +114,20 @@ def init_db() -> None:
                 """,
             )
 
-        # Future migrations go here (v3, v4, ...).
+        # v3: memory decay support
+        if current < 3:
+            apply(
+                3,
+                """
+                ALTER TABLE memories ADD COLUMN last_accessed_at TEXT;
+                ALTER TABLE memories ADD COLUMN access_count INTEGER DEFAULT 0;
+                ALTER TABLE memories ADD COLUMN cached_strength REAL DEFAULT 1.0;
+                ALTER TABLE memories ADD COLUMN strength_updated_at TEXT;
+                CREATE INDEX IF NOT EXISTS idx_memories_cached_strength ON memories(cached_strength);
+                """,
+            )
+
+        # Future migrations go here (v4, v5, ...).
 
         conn.commit()
     finally:
